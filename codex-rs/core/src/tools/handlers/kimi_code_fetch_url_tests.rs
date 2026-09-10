@@ -13,22 +13,31 @@ fn parse_url(url: &str) -> reqwest::Url {
     reqwest::Url::parse(url).unwrap_or_else(|err| panic!("test URL should parse ({url}): {err}"))
 }
 
-fn lookup_should_not_run(
-    host: String,
-    _port: u16,
-) -> impl std::future::Future<Output = io::Result<Vec<SocketAddr>>> {
-    async move { panic!("DNS lookup should not run for {host}") }
+async fn lookup_should_not_run(host: String, _port: u16) -> io::Result<Vec<SocketAddr>> {
+    panic!("DNS lookup should not run for {host}")
 }
 
-fn lookup_addrs(
-    addrs: Vec<SocketAddr>,
-) -> impl FnOnce(
-    String,
-    u16,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = io::Result<Vec<SocketAddr>>> + Send>,
-> {
-    move |_host, _port| Box::pin(async move { Ok(addrs) })
+async fn lookup_private(_host: String, port: u16) -> io::Result<Vec<SocketAddr>> {
+    Ok(vec![SocketAddr::from(([10, 0, 0, 1], port))])
+}
+
+async fn lookup_public(_host: String, port: u16) -> io::Result<Vec<SocketAddr>> {
+    Ok(vec![SocketAddr::from(([93, 184, 216, 34], port))])
+}
+
+async fn lookup_mixed_public_and_loopback(_host: String, port: u16) -> io::Result<Vec<SocketAddr>> {
+    Ok(vec![
+        SocketAddr::from(([93, 184, 216, 34], port)),
+        SocketAddr::from(([127, 0, 0, 1], port)),
+    ])
+}
+
+async fn lookup_empty(_host: String, _port: u16) -> io::Result<Vec<SocketAddr>> {
+    Ok(Vec::new())
+}
+
+async fn lookup_failed(_host: String, _port: u16) -> io::Result<Vec<SocketAddr>> {
+    Err(io::Error::other("lookup failed"))
 }
 
 #[tokio::test]
@@ -86,11 +95,7 @@ async fn rejects_metadata_style_link_local_redirect_target() {
 async fn rejects_hostname_that_resolves_to_a_private_or_loopback_address() {
     let url = parse_url("https://example.test/docs");
     assert_eq!(
-        ensure_public_http_url_with_lookup(
-            &url,
-            lookup_addrs(vec![SocketAddr::from(([10, 0, 0, 1], 443))])
-        )
-        .await,
+        ensure_public_http_url_with_lookup(&url, lookup_private).await,
         Err(FunctionCallError::RespondToModel(
             FETCH_URL_NON_PUBLIC.to_string()
         ))
@@ -98,14 +103,7 @@ async fn rejects_hostname_that_resolves_to_a_private_or_loopback_address() {
 
     let url = parse_url("http://example.test/");
     assert_eq!(
-        ensure_public_http_url_with_lookup(
-            &url,
-            lookup_addrs(vec![
-                SocketAddr::from(([93, 184, 216, 34], 80)),
-                SocketAddr::from(([127, 0, 0, 1], 80)),
-            ])
-        )
-        .await,
+        ensure_public_http_url_with_lookup(&url, lookup_mixed_public_and_loopback).await,
         Err(FunctionCallError::RespondToModel(
             FETCH_URL_NON_PUBLIC.to_string()
         ))
@@ -116,17 +114,14 @@ async fn rejects_hostname_that_resolves_to_a_private_or_loopback_address() {
 async fn rejects_when_dns_cannot_prove_the_host_is_public() {
     let url = parse_url("https://example.test/");
     assert_eq!(
-        ensure_public_http_url_with_lookup(&url, |_host, _port| async {
-            Err(io::Error::other("lookup failed"))
-        })
-        .await,
+        ensure_public_http_url_with_lookup(&url, lookup_failed).await,
         Err(FunctionCallError::RespondToModel(
             FETCH_URL_UNVERIFIED.to_string()
         ))
     );
 
     assert_eq!(
-        ensure_public_http_url_with_lookup(&url, lookup_addrs(Vec::new())).await,
+        ensure_public_http_url_with_lookup(&url, lookup_empty).await,
         Err(FunctionCallError::RespondToModel(
             FETCH_URL_UNVERIFIED.to_string()
         ))
@@ -172,11 +167,7 @@ async fn allows_public_ip_literals_and_hostnames_that_resolve_publicly() {
 
     let url = parse_url("https://example.test/path");
     assert_eq!(
-        ensure_public_http_url_with_lookup(
-            &url,
-            lookup_addrs(vec![SocketAddr::from(([93, 184, 216, 34], 443))])
-        )
-        .await,
+        ensure_public_http_url_with_lookup(&url, lookup_public).await,
         Ok(())
     );
 }
