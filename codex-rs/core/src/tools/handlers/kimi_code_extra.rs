@@ -1,3 +1,10 @@
+use std::future::Future;
+use std::io;
+use std::net::IpAddr;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use codex_network_proxy::is_non_public_ip;
 use codex_tools::AdditionalProperties;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
@@ -5,6 +12,9 @@ use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use regex_lite::Regex;
 use serde::Deserialize;
+use tokio::net::lookup_host;
+use tokio::time::timeout;
+use url::Host;
 
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
@@ -131,36 +141,147 @@ struct FetchUrlArgs {
     url: String,
 }
 
+const MAX_FETCH_URL_REDIRECTS: usize = 10;
+const MAX_FETCH_BODY_BYTES: usize = 1_048_576;
+const FETCH_URL_DNS_TIMEOUT: Duration = Duration::from_secs(2);
+const FETCH_URL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const FETCH_URL_NON_PUBLIC: &str = "FetchURL does not fetch private or loopback addresses.";
+const FETCH_URL_SCHEME: &str = "FetchURL supports only http and https URLs.";
+const FETCH_URL_INCOMPLETE: &str = "FetchURL requires a fully-formed public http or https URL.";
+const FETCH_URL_UNVERIFIED: &str = "FetchURL could not verify that the URL is public.";
+
 async fn handle_fetch_url(
     invocation: ToolInvocation,
 ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
     let args: FetchUrlArgs = parse_invocation_arguments(&invocation)?;
-    let url = reqwest::Url::parse(&args.url)
+    let mut url = reqwest::Url::parse(&args.url)
         .map_err(|err| FunctionCallError::RespondToModel(format!("Invalid URL: {err}")))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(FunctionCallError::RespondToModel(
-            "FetchURL supports only http and https URLs.".to_string(),
-        ));
-    }
-    let response = reqwest::Client::new()
-        .get(url.clone())
-        .send()
-        .await
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(FETCH_URL_REQUEST_TIMEOUT)
+        .build()
         .map_err(|err| FunctionCallError::RespondToModel(format!("FetchURL failed: {err}")))?;
+
+    let mut redirects = 0;
+    let response = loop {
+        ensure_public_http_url(&url).await?;
+        let response =
+            client.get(url.clone()).send().await.map_err(|err| {
+                FunctionCallError::RespondToModel(format!("FetchURL failed: {err}"))
+            })?;
+        let status = response.status();
+        if !status.is_redirection() {
+            break response;
+        }
+        if redirects >= MAX_FETCH_URL_REDIRECTS {
+            return Err(FunctionCallError::RespondToModel(
+                "FetchURL failed: too many redirects.".to_string(),
+            ));
+        }
+        let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "FetchURL failed with HTTP {status}."
+            )));
+        };
+        let location = location.to_str().map_err(|_| {
+            FunctionCallError::RespondToModel(format!("FetchURL failed with HTTP {status}."))
+        })?;
+        url = url
+            .join(location)
+            .map_err(|err| FunctionCallError::RespondToModel(format!("Invalid URL: {err}")))?;
+        redirects += 1;
+    };
+
     let status = response.status();
     if !status.is_success() {
         return Err(FunctionCallError::RespondToModel(format!(
             "FetchURL failed with HTTP {status}."
         )));
     }
-    let body = response
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_FETCH_BODY_BYTES as u64)
+    {
+        return Err(FunctionCallError::RespondToModel(
+            "FetchURL refused a response that exceeded the size limit.".to_string(),
+        ));
+    }
+    let mut body = response
         .text()
         .await
         .map_err(|err| FunctionCallError::RespondToModel(format!("FetchURL failed: {err}")))?;
+    if body.len() > MAX_FETCH_BODY_BYTES {
+        body.truncate(MAX_FETCH_BODY_BYTES);
+    }
     let content = extract_page_text(&body);
     text_output(format!(
         "The returned content is the main text extracted from the page. If you use it in your answer, cite this page as a markdown link, e.g. [title](url).\n\n{content}"
     ))
+}
+
+async fn ensure_public_http_url(url: &reqwest::Url) -> Result<(), FunctionCallError> {
+    ensure_public_http_url_with_lookup(url, |host, port| async move {
+        lookup_host((host.as_str(), port))
+            .await
+            .map(Iterator::collect)
+    })
+    .await
+}
+
+async fn ensure_public_http_url_with_lookup<F, Fut>(
+    url: &reqwest::Url,
+    lookup: F,
+) -> Result<(), FunctionCallError>
+where
+    F: FnOnce(String, u16) -> Fut,
+    Fut: Future<Output = io::Result<Vec<SocketAddr>>>,
+{
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(FunctionCallError::RespondToModel(
+            FETCH_URL_SCHEME.to_string(),
+        ));
+    }
+    match url.host() {
+        None => Err(FunctionCallError::RespondToModel(
+            FETCH_URL_INCOMPLETE.to_string(),
+        )),
+        Some(Host::Ipv4(ip)) => reject_non_public_ip(IpAddr::V4(ip)),
+        Some(Host::Ipv6(ip)) => reject_non_public_ip(IpAddr::V6(ip)),
+        Some(Host::Domain(domain)) => {
+            let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
+            if normalized == "localhost" || normalized.ends_with(".localhost") {
+                return Err(non_public_url_error());
+            }
+            if let Ok(ip) = normalized.parse::<IpAddr>() {
+                return reject_non_public_ip(ip);
+            }
+            let port = url.port_or_known_default().unwrap_or(80);
+            let addrs = match timeout(FETCH_URL_DNS_TIMEOUT, lookup(normalized, port)).await {
+                Ok(Ok(addrs)) if !addrs.is_empty() => addrs,
+                _ => {
+                    return Err(FunctionCallError::RespondToModel(
+                        FETCH_URL_UNVERIFIED.to_string(),
+                    ));
+                }
+            };
+            if addrs.iter().any(|addr| is_non_public_ip(addr.ip())) {
+                return Err(non_public_url_error());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn reject_non_public_ip(ip: IpAddr) -> Result<(), FunctionCallError> {
+    if is_non_public_ip(ip) {
+        Err(non_public_url_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn non_public_url_error() -> FunctionCallError {
+    FunctionCallError::RespondToModel(FETCH_URL_NON_PUBLIC.to_string())
 }
 
 fn extract_page_text(html: &str) -> String {
@@ -218,6 +339,10 @@ fn text_output(text: impl Into<String>) -> Result<Box<dyn ToolOutput>, FunctionC
         Some(true),
     )))
 }
+
+#[cfg(test)]
+#[path = "kimi_code_fetch_url_tests.rs"]
+mod fetch_url_tests;
 
 #[cfg(test)]
 mod tests {
