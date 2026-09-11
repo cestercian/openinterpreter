@@ -3,7 +3,7 @@
 <p align="center">A coding agent optimized for low-cost models. <a href="https://www.openinterpreter.com/blog/open-interpreter?utm_source=github&amp;utm_medium=referral&amp;utm_campaign=readme&amp;utm_content=hero_text"><strong>Blog post ↗</strong></a></p>
 
 <p align="center">
-  <b>English</b> • <a href="README_ES.md">Español</a> • <a href="README_ZH.md">简体中文</a>
+  <b>English</b> • <a href="README_ES.md">Español</a> • <a href="README_ZH.md">简体中文</a> • <a href="README_JA.md">日本語</a>
 </p>
 
 <p align="center">
@@ -104,6 +104,8 @@ Open Interpreter ships with a QA skill that lets any model operate and test inte
 
 - Runs commands inside native sandboxing on macOS, Linux, and Windows.
 - Switches providers and models from the TUI with `/model`.
+- Runs any selected OpenAI-compatible provider through Chat Completions with
+  `interpreter --chat-completions` or `interpreter exec --chat-completions`.
 - Inspects or switches Rust-native model harnesses with `/harness`.
 - Tests web and native apps through the built-in QA skill.
 - Runs as an [Agent Client Protocol](https://agentclientprotocol.com/) agent for editors with `interpreter acp`.
@@ -125,7 +127,7 @@ Open Interpreter ships with a QA skill that lets any model operate and test inte
   - [Z.AI, GLM, and ZCode](https://www.openinterpreter.com/docs/terminal/zai-glm?utm_source=github&utm_medium=referral&utm_campaign=readme&utm_content=zai_glm_docs)
 - [Agent Client Protocol](https://www.openinterpreter.com/docs/terminal/acp)
 - [Codex SDK](https://www.openinterpreter.com/docs/terminal/sdk)
-- [Portability](https://www.openinterpreter.com/docs/terminal/portability)
+- [Portability](https://github.com/openinterpreter/openinterpreter/blob/main/docs/portability.md)
 - [Sandbox & approvals](https://www.openinterpreter.com/docs/terminal/sandbox?utm_source=github&utm_medium=referral&utm_campaign=readme&utm_content=sandbox_approvals)
 - [Branding a distribution fork](FORK_BRANDING.md)
 

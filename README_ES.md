@@ -1,11 +1,11 @@
-<!-- README translation source: README.md sha256=1b75430c73f72e6925f46a696dae97c046d4ecc43cc0a9d1efb294a29a2f85c4 -->
+<!-- README translation source: README.md sha256=d5db2b994d859b4186348f83bf35783a86b3f79e363d0c92100dbf06707ced16 -->
 
 <h1 align="center">Open Interpreter</h1>
 
 <p align="center">Un agente de programación optimizado para modelos de bajo costo. <a href="https://www.openinterpreter.com/blog/open-interpreter?utm_source=github&amp;utm_medium=referral&amp;utm_campaign=readme&amp;utm_content=hero_text"><strong>Artículo del blog ↗</strong></a></p>
 
 <p align="center">
-  <a href="README.md">English</a> • <b>Español</b> • <a href="README_ZH.md">简体中文</a>
+  <a href="README.md">English</a> • <b>Español</b> • <a href="README_ZH.md">简体中文</a> • <a href="README_JA.md">日本語</a>
 </p>
 
 <p align="center">
@@ -88,6 +88,8 @@ Open Interpreter incluye una habilidad de QA que permite a cualquier modelo oper
 
 - Ejecuta comandos con aislamiento nativo en macOS, Linux y Windows.
 - Cambia de proveedor y modelo desde la TUI con `/model`.
+- Ejecuta cualquier proveedor compatible con OpenAI mediante Chat Completions
+  con `interpreter --chat-completions` o `interpreter exec --chat-completions`.
 - Inspecciona o cambia harnesses de modelos nativos de Rust con `/harness`.
 - Prueba aplicaciones web y nativas mediante la habilidad de QA integrada.
 - Funciona como agente del [Protocolo de Cliente de Agente](https://agentclientprotocol.com/) para editores mediante `interpreter acp`.
