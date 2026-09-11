@@ -150,21 +150,50 @@ const FETCH_URL_SCHEME: &str = "FetchURL supports only http and https URLs.";
 const FETCH_URL_INCOMPLETE: &str = "FetchURL requires a fully-formed public http or https URL.";
 const FETCH_URL_UNVERIFIED: &str = "FetchURL could not verify that the URL is public.";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicHttpTarget {
+    pinned_dns: Option<PinnedDns>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PinnedDns {
+    host: String,
+    addrs: Vec<SocketAddr>,
+}
+
 async fn handle_fetch_url(
     invocation: ToolInvocation,
 ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
     let args: FetchUrlArgs = parse_invocation_arguments(&invocation)?;
-    let mut url = reqwest::Url::parse(&args.url)
+    let url = reqwest::Url::parse(&args.url)
         .map_err(|err| FunctionCallError::RespondToModel(format!("Invalid URL: {err}")))?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(FETCH_URL_REQUEST_TIMEOUT)
-        .build()
-        .map_err(|err| FunctionCallError::RespondToModel(format!("FetchURL failed: {err}")))?;
+    let body = fetch_url_with_lookup(url, |host, port| async move {
+        lookup_host((host.as_str(), port))
+            .await
+            .map(Iterator::collect)
+    })
+    .await?;
+    let content = extract_page_text(&body);
+    text_output(format!(
+        "The returned content is the main text extracted from the page. If you use it in your answer, cite this page as a markdown link, e.g. [title](url).\n\n{content}"
+    ))
+}
 
+async fn fetch_url_with_lookup<F, Fut>(
+    mut url: reqwest::Url,
+    mut lookup: F,
+) -> Result<String, FunctionCallError>
+where
+    F: FnMut(String, u16) -> Fut,
+    Fut: Future<Output = io::Result<Vec<SocketAddr>>>,
+{
     let mut redirects = 0;
     let response = loop {
-        ensure_public_http_url(&url).await?;
+        let target =
+            resolve_public_http_url_with_lookup(&url, |host, port| lookup(host, port)).await?;
+        let client = fetch_client_builder(target.pinned_dns.as_ref())
+            .build()
+            .map_err(|err| FunctionCallError::RespondToModel(format!("FetchURL failed: {err}")))?;
         let response =
             client.get(url.clone()).send().await.map_err(|err| {
                 FunctionCallError::RespondToModel(format!("FetchURL failed: {err}"))
@@ -198,6 +227,24 @@ async fn handle_fetch_url(
             "FetchURL failed with HTTP {status}."
         )));
     }
+    read_fetch_body(response).await
+}
+
+fn fetch_client_builder(pinned_dns: Option<&PinnedDns>) -> reqwest::ClientBuilder {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(FETCH_URL_REQUEST_TIMEOUT);
+    if let Some(PinnedDns { host, addrs }) = pinned_dns {
+        builder = builder.resolve_to_addrs(host, addrs);
+        let trimmed = host.trim_end_matches('.');
+        if trimmed != host {
+            builder = builder.resolve_to_addrs(trimmed, addrs);
+        }
+    }
+    builder
+}
+
+async fn read_fetch_body(mut response: reqwest::Response) -> Result<String, FunctionCallError> {
     if response
         .content_length()
         .is_some_and(|len| len > MAX_FETCH_BODY_BYTES as u64)
@@ -206,32 +253,36 @@ async fn handle_fetch_url(
             "FetchURL refused a response that exceeded the size limit.".to_string(),
         ));
     }
-    let mut body = response
-        .text()
-        .await
-        .map_err(|err| FunctionCallError::RespondToModel(format!("FetchURL failed: {err}")))?;
-    if body.len() > MAX_FETCH_BODY_BYTES {
-        body.truncate(MAX_FETCH_BODY_BYTES);
+
+    let mut body = Vec::new();
+    loop {
+        if body.len() >= MAX_FETCH_BODY_BYTES {
+            break;
+        }
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = MAX_FETCH_BODY_BYTES - body.len();
+                if chunk.len() > remaining {
+                    body.extend_from_slice(&chunk[..remaining]);
+                    break;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(err) => {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "FetchURL failed: {err}"
+                )));
+            }
+        }
     }
-    let content = extract_page_text(&body);
-    text_output(format!(
-        "The returned content is the main text extracted from the page. If you use it in your answer, cite this page as a markdown link, e.g. [title](url).\n\n{content}"
-    ))
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
-async fn ensure_public_http_url(url: &reqwest::Url) -> Result<(), FunctionCallError> {
-    ensure_public_http_url_with_lookup(url, |host, port| async move {
-        lookup_host((host.as_str(), port))
-            .await
-            .map(Iterator::collect)
-    })
-    .await
-}
-
-async fn ensure_public_http_url_with_lookup<F, Fut>(
+async fn resolve_public_http_url_with_lookup<F, Fut>(
     url: &reqwest::Url,
     lookup: F,
-) -> Result<(), FunctionCallError>
+) -> Result<PublicHttpTarget, FunctionCallError>
 where
     F: FnOnce(String, u16) -> Fut,
     Fut: Future<Output = io::Result<Vec<SocketAddr>>>,
@@ -245,15 +296,22 @@ where
         None => Err(FunctionCallError::RespondToModel(
             FETCH_URL_INCOMPLETE.to_string(),
         )),
-        Some(Host::Ipv4(ip)) => reject_non_public_ip(IpAddr::V4(ip)),
-        Some(Host::Ipv6(ip)) => reject_non_public_ip(IpAddr::V6(ip)),
+        Some(Host::Ipv4(ip)) => {
+            reject_non_public_ip(IpAddr::V4(ip))?;
+            Ok(PublicHttpTarget { pinned_dns: None })
+        }
+        Some(Host::Ipv6(ip)) => {
+            reject_non_public_ip(IpAddr::V6(ip))?;
+            Ok(PublicHttpTarget { pinned_dns: None })
+        }
         Some(Host::Domain(domain)) => {
             let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
             if normalized == "localhost" || normalized.ends_with(".localhost") {
                 return Err(non_public_url_error());
             }
             if let Ok(ip) = normalized.parse::<IpAddr>() {
-                return reject_non_public_ip(ip);
+                reject_non_public_ip(ip)?;
+                return Ok(PublicHttpTarget { pinned_dns: None });
             }
             let port = url.port_or_known_default().unwrap_or(80);
             let addrs = match timeout(FETCH_URL_DNS_TIMEOUT, lookup(normalized, port)).await {
@@ -267,7 +325,10 @@ where
             if addrs.iter().any(|addr| is_non_public_ip(addr.ip())) {
                 return Err(non_public_url_error());
             }
-            Ok(())
+            let host = url.host_str().unwrap_or(domain).to_string();
+            Ok(PublicHttpTarget {
+                pinned_dns: Some(PinnedDns { host, addrs }),
+            })
         }
     }
 }
